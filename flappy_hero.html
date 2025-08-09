@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Flappy Hero — Local Leaderboard</title>
+  <style>
+    :root{--scale:1.2}
+    html,body{height:100%;margin:0;background:#111;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial}
+    .wrap{display:flex;align-items:center;justify-content:center;height:100%;gap:22px}
+    /* pixel-crisp canvas */
+    #gameCanvas{image-rendering:pixelated;border:6px solid #222;background:#7ec0ff;display:block}
+    .panel{width:260px}
+    h1{font-size:20px;margin:0 0 8px}
+    .hud{background:#0b0b0b88;padding:12px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.6)}
+    button{display:inline-block;padding:8px 10px;margin-top:8px;border-radius:6px;border:0;background:#ffd166;color:#111;font-weight:700;cursor:pointer}
+    input[type=text]{width:100%;padding:6px;border-radius:6px;border:1px solid #333;background:#111;color:#fff;margin-top:8px}
+    .leaderboard{margin-top:10px}
+    .lb-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed #222;font-size:14px}
+    .small{font-size:13px;color:#cfcfcf}
+    .footer{margin-top:8px;font-size:12px;color:#bbb}
+    /* layout for pixel scale on large screens */
+    @media(min-width:900px){:root{--scale:1.6}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="gameCanvas" width="320" height="480"></canvas>
+
+    <div class="panel">
+      <div class="hud">
+        <h1>Flappy Hero</h1>
+        <div class="small">Controls: Spacebar / Click - flap<br>Goal: Pass skyscrapers. Desktop focused.</div>
+
+        <div style="margin-top:8px">
+          <strong>Score:</strong> <span id="score">0</span><br>
+          <strong>Best:</strong> <span id="best">0</span>
+        </div>
+
+        <div style="margin-top:8px">
+          <input id="playerName" type="text" placeholder="Your name (for leaderboard)" maxlength="16" />
+          <button id="startBtn">Start Game</button>
+          <button id="resetBtn" title="Clear leaderboard" style="background:#ef476f">Clear Leaderboard</button>
+        </div>
+
+        <div class="leaderboard">
+          <h3 style="margin:8px 0 4px">Local Leaderboard</h3>
+          <div id="leaderboardList"></div>
+        </div>
+
+        <div class="footer">Built as a single-file playable HTML — pixel art style. Sound plays on score increase.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ------------------ Configuration ------------------
+    const WIDTH = 320, HEIGHT = 480;
+    const SCALE = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+
+    // Game constants (tweakable)
+    const GRAVITY = 900; // px/s^2 (stronger due to pixel art scale)
+    const FLAP_V = -300; // px/s impulse when flap
+    const PIPE_SPEED = -110; // px/s leftwards
+    const PIPE_INTERVAL = 1600; // milliseconds between pipes
+    const GAP_SIZE = 120; // gap height in px
+    const PIPE_WIDTH = 52;
+
+    // ------------------ Canvas setup ------------------
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    // make pixelated on resize
+    function fitCanvas(){
+      // CSS scaling to give crisp pixel look
+      const hScale = (window.innerHeight - 80) / HEIGHT;
+      const wScale = (window.innerWidth - 440) / WIDTH;
+      let scale = Math.min(hScale, wScale, 1.6);
+      if (!isFinite(scale) || scale <= 0) scale = 1; // guard against tiny windows
+      canvas.style.width = Math.round(WIDTH * scale) + 'px';
+      canvas.style.height = Math.round(HEIGHT * scale) + 'px';
+    }
+    fitCanvas();
+    window.addEventListener('resize', fitCanvas);
+
+    // ------------------ Game state ------------------
+    let hero = {x:80,y:HEIGHT/2-8,w:18,h:18,vy:0};
+    let pipes = [];
+    let lastPipeAt = 0;
+    let lastTime = null;
+    let running = false;
+    let score = 0;
+    let best = 0;
+
+    // Leaderboard (localStorage)
+    const LB_KEY = 'flappy_hero_leaderboard_v1';
+    function loadLeaderboard(){
+      try{ return JSON.parse(localStorage.getItem(LB_KEY)) || []; }catch(e){return []}
+    }
+    function saveLeaderboard(lb){ localStorage.setItem(LB_KEY, JSON.stringify(lb)); }
+
+    function addToLeaderboard(name, score){
+      if(!name) name = 'Player';
+      const lb = loadLeaderboard();
+      lb.push({name,score,when:Date.now()});
+      lb.sort((a,b)=>b.score-a.score);
+      if(lb.length>10) lb.length = 10;
+      saveLeaderboard(lb);
+      renderLeaderboard();
+    }
+
+    function clearLeaderboard(){ localStorage.removeItem(LB_KEY); renderLeaderboard(); }
+
+    function renderLeaderboard(){
+      const list = document.getElementById('leaderboardList');
+      const lb = loadLeaderboard();
+      list.innerHTML = '';
+      if(lb.length===0){ list.innerHTML = '<div class="small">No scores yet. Play to add!</div>'; return }
+      lb.forEach((r,i)=>{
+        const row = document.createElement('div'); row.className='lb-row';
+        row.innerHTML = `<div>${i+1}. ${escapeHtml(r.name)}</div><div>${r.score}</div>`;
+        list.appendChild(row);
+      });
+    }
+
+    // Safe escapeHtml implementation (fixed regex and added single-quote escape)
+    function escapeHtml(s){
+      const map = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+      return String(s).replace(/[&<>"']/g, function(c){ return map[c]; });
+    }
+
+    // ------------------ Audio: simple blip on score ------------------
+    // Create AudioContext lazily to avoid autoplay restrictions on some browsers.
+    let audioCtx = null;
+    function getAudioCtx(){ if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); return audioCtx; }
+    function playScoreSound(){
+      try{
+        const a = getAudioCtx();
+        const o = a.createOscillator();
+        const g = a.createGain();
+        o.type = 'square';
+        o.frequency.setValueAtTime(880, a.currentTime);
+        g.gain.setValueAtTime(0.0001, a.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.08, a.currentTime + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + 0.15);
+        o.connect(g); g.connect(a.destination);
+        o.start(); o.stop(a.currentTime + 0.16);
+      }catch(e){ /* ignore audio errors on unsupported browsers */ }
+    }
+
+    // ------------------ Input ------------------
+    function flap(){
+      if(!running) startGame();
+      hero.vy = FLAP_V;
+      // resume audio on user gesture if needed
+      const a = getAudioCtx(); if(a.state === 'suspended') a.resume();
+    }
+
+    window.addEventListener('keydown', (e)=>{ if(e.code==='Space'){ e.preventDefault(); flap(); } });
+    canvas.addEventListener('mousedown', (e)=>{ flap(); });
+
+    // ------------------ Pipes ------------------
+    function spawnPipe(){
+      const margin = 32;
+      const minGapTop = 28; // top must be at least this
+      const maxTop = HEIGHT - GAP_SIZE - minGapTop - margin;
+      const top = Math.floor(minGapTop + Math.random() * (Math.max(0, maxTop - minGapTop)));
+      const pipe = {x:WIDTH+10, top:top, gap:GAP_SIZE, passed:false};
+      pipes.push(pipe);
+    }
+
+    // ------------------ Reset / Start / Game Over ------------------
+    function reset(){
+      hero = {x:80,y:HEIGHT/2-8,w:18,h:18,vy:0};
+      pipes = [];
+      lastPipeAt = 0;
+      score = 0;
+      running = false;
+      updateHud();
+    }
+
+    function startGame(){
+      const a = getAudioCtx(); if(a.state === 'suspended') a.resume();
+      reset();
+      running = true;
+      lastTime = performance.now();
+      lastPipeAt = lastTime + 300;
+      requestAnimationFrame(loop);
+    }
+
+    function gameOver(){
+      running = false;
+      const name = document.getElementById('playerName').value.trim() || 'Player';
+      // only add if score>0
+      if(score>0) addToLeaderboard(name, score);
+      best = Math.max(best, score);
+      localStorage.setItem('flappy_hero_best', best);
+      document.getElementById('best').textContent = best;
+      updateHud();
+      // small bounce effect
+      flashGameOver();
+    }
+
+    function flashGameOver(){
+      // simple animation: flash canvas border
+      canvas.style.borderColor = '#ef476f';
+      setTimeout(()=>{ canvas.style.borderColor = '#222'; }, 350);
+    }
+
+    // ------------------ HUD ------------------
+    function updateHud(){
+      document.getElementById('score').textContent = score;
+      const storedBest = parseInt(localStorage.getItem('flappy_hero_best')||'0',10);
+      best = Math.max(storedBest||0, best);
+      document.getElementById('best').textContent = best;
+    }
+
+    // ------------------ Collision ------------------
+    function rectsOverlap(a,b){
+      return !(a.x+a.w < b.x || a.x > b.x+b.w || a.y+a.h < b.y || a.y > b.y+b.h);
+    }
+
+    // ------------------ Rendering (pixel art style) ------------------
+    function draw(){
+      // clear (sky)
+      ctx.fillStyle = '#7ec0ff'; ctx.fillRect(0,0,WIDTH,HEIGHT);
+      drawGround();
+      drawPipes();
+      drawHero();
+      drawScoreBig();
+    }
+
+    function drawGround(){
+      // city ground silhouette at bottom
+      ctx.fillStyle = '#123'; ctx.fillRect(0, HEIGHT-48, WIDTH, 48);
+      // small pixel buildings to give depth
+      for(let i=0;i<WIDTH;i+=20){
+        const h = 8 + ((i*37)%28);
+        ctx.fillStyle = '#0d2333'; ctx.fillRect(i, HEIGHT-48 - h, 12, h);
+      }
+    }
+
+    function drawPipes(){
+      pipes.forEach(p=>{
+        // top building
+        ctx.fillStyle = '#2b2d42';
+        ctx.fillRect(p.x, 0, PIPE_WIDTH, p.top);
+        // bottom building
+        ctx.fillRect(p.x, p.top + p.gap, PIPE_WIDTH, HEIGHT - (p.top + p.gap) - 48);
+        // windows (pixel art)
+        ctx.fillStyle = '#ffd';
+        for(let y=8;y<p.top-6;y+=10){
+          for(let x=6;x<PIPE_WIDTH-6;x+=8){ ctx.fillRect(p.x+x,y,3,4); }
+        }
+        for(let y=p.top+p.gap+8;y<HEIGHT-56;y+=10){
+          for(let x=6;x<PIPE_WIDTH-6;x+=8){ ctx.fillRect(p.x+x,y,3,4); }
+        }
+      });
+    }
+
+    function drawHero(){
+      // simple pixel superhero (square head, cape)
+      const x = Math.round(hero.x), y = Math.round(hero.y);
+      // shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(x+2, y+hero.h+2, hero.w, 4);
+      // body
+      ctx.fillStyle = '#ffcc00'; ctx.fillRect(x+3,y+4,12,10); // torso
+      // head
+      ctx.fillStyle = '#ffd1a9'; ctx.fillRect(x+5,y,8,7);
+      // eyes
+      ctx.fillStyle = '#112'; ctx.fillRect(x+7,y+2,2,2); ctx.fillRect(x+11,y+2,2,2);
+      // cape
+      ctx.fillStyle = '#ef476f'; ctx.fillRect(x-8,y+6,10,6);
+      // boots
+      ctx.fillStyle = '#2b2d42'; ctx.fillRect(x+3,y+14,5,3); ctx.fillRect(x+10,y+14,5,3);
+    }
+
+    function drawScoreBig(){
+      ctx.fillStyle = '#0008'; ctx.font = '18px monospace'; ctx.textAlign='left';
+      ctx.fillText('Score: '+score, 8, 22);
+    }
+
+    // ------------------ Game loop ------------------
+    function loop(ts){
+      if(!lastTime) lastTime = ts; // init
+      const dt = Math.min(60, ts - lastTime) / 1000; // seconds
+      lastTime = ts;
+
+      if(running){
+        // physics
+        hero.vy += GRAVITY * dt;
+        hero.y += hero.vy * dt;
+
+        // spawn pipes
+        if(ts - lastPipeAt > PIPE_INTERVAL){ spawnPipe(); lastPipeAt = ts; }
+
+        // move pipes
+        for(let p of pipes){ p.x += PIPE_SPEED * dt; }
+        // remove offscreen
+        pipes = pipes.filter(p=>p.x > -PIPE_WIDTH-40);
+
+        // scoring: when pipe's right edge passes hero.x and hasn't been marked
+        for(let p of pipes){
+          if(!p.passed && (p.x + PIPE_WIDTH) < hero.x){ p.passed = true; score++; updateHud(); playScoreSound(); }
+        }
+
+        // collisions with pipes
+        for(let p of pipes){
+          const topRect = {x:p.x,y:0,w:PIPE_WIDTH,h:p.top};
+          const botRect = {x:p.x,y:p.top+p.gap,w:PIPE_WIDTH,h:HEIGHT - (p.top + p.gap) - 48};
+          const hRect = {x:hero.x,y:hero.y,w:hero.w,h:hero.h};
+          if(rectsOverlap(hRect, topRect) || rectsOverlap(hRect, botRect)){
+            gameOver();
+          }
+        }
+
+        // collision with ground or ceiling
+        if(hero.y + hero.h >= HEIGHT-48 || hero.y < 0){ gameOver(); }
+      }
+
+      // draw always
+      draw();
+
+      if(running) requestAnimationFrame(loop);
+    }
+
+    // ------------------ UI wiring ------------------
+    document.getElementById('startBtn').addEventListener('click', ()=>{ if(!running) startGame(); else { reset(); } });
+    document.getElementById('resetBtn').addEventListener('click', ()=>{ if(confirm('Clear local leaderboard?')) clearLeaderboard(); });
+
+    // init
+    (function init(){
+      renderLeaderboard();
+      updateHud();
+      // preload best
+      best = parseInt(localStorage.getItem('flappy_hero_best')||'0',10);
+      document.getElementById('best').textContent = best;
+      // initial draw
+      draw();
+
+      // --- Self-tests to ensure escapeHtml works (runs in console) ---
+      try{
+        const sample = '<>&"\'';
+        const escaped = escapeHtml(sample);
+        console.log('Self-test escapeHtml: input=', sample, ' escaped=', escaped);
+        console.assert(escaped === '&lt;&gt;&amp;&quot;&#39;', 'escapeHtml produced unexpected result');
+      }catch(e){ console.warn('Self-test failed', e); }
+
+    })();
+
+  </script>
+</body>
+</html>
